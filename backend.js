@@ -863,6 +863,7 @@ server.post("/webhook/lemonsqueezy", bodyParser.raw({ type: "application/json" }
 // Regular JSON middleware
 server.use(express.json({ limit: "10mb" }));
 
+/*
 // ─── Admin: Approve Manual Payment Request ───────────────────────────────────
 server.post("/api/admin/approve-request", async (req, res) => {
   const { requestId, db: dbType } = req.body;
@@ -953,6 +954,7 @@ server.post("/api/admin/decline-request", async (req, res) => {
     return res.status(500).json({ success: false, message: err.message });
   }
 });
+*/
 
 // ─── Admin: Generate Invoice PDF On-Demand ──────────────────────────────
 server.post("/api/admin/generate-invoice-pdf-on-demand", async (req, res) => {
@@ -1309,6 +1311,7 @@ const handleActivation = async (req, res) => {
 server.post("/api/activate", activateLimiter, handleActivation);
 server.post("/api/activate-node", activateLimiter, handleActivation);
 
+/*
 // ==========================================
 // FIREBASE RTDB LISTENERS (Crypto auto-detection)
 // ==========================================
@@ -1386,6 +1389,7 @@ if (hasServiceAccount || process.env.GOOGLE_APPLICATION_CREDENTIALS || process.e
     }
   });
 }
+*/
 
 // ==========================================
 // START SERVER
@@ -1395,5 +1399,5 @@ server.listen(PORT, () => {
   console.log(`🚀 Backend Server running on http://localhost:${PORT}`);
   console.log("📄 Invoice Engine: Puppeteer-Core (system Edge/Chrome)");
   console.log("📧 Email Engine: Nodemailer →", process.env.SMTP_HOST || "smtp-relay.brevo.com");
-  console.log("📡 Endpoints: /api/admin/approve-request | /api/admin/decline-request | /api/activate | /api/activate-node");
+  console.log("📡 Endpoints: /api/activate | /api/activate-node | /api/create-checkout | /webhook/lemonsqueezy");
 });
