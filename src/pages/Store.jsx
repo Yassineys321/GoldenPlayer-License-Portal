@@ -227,6 +227,7 @@ const Store = () => {
             activating={activating}
             planType="1YEAR"
             onActivate={() => handleActivate('1YEAR')}
+            loading={loading}
           />
           <PlanCard 
             title={t('perpetual_enterprise')} 
@@ -240,6 +241,7 @@ const Store = () => {
             activating={activating}
             planType="LIFETIME"
             onActivate={() => handleActivate('LIFETIME')}
+            loading={loading}
           />
         </div>
 
@@ -248,7 +250,7 @@ const Store = () => {
   );
 };
 
-const PlanCard = ({ title, desc, price, coins, icon, featured, onSelect, userCoins, activating, planType, onActivate, fullWidth = false }) => {
+const PlanCard = ({ title, desc, price, coins, icon, featured, onSelect, userCoins, activating, planType, onActivate, fullWidth = false, loading }) => {
   const { t } = useLanguage();
   const [hovered, setHovered] = useState(false);
   const canActivate = userCoins >= coins;
