@@ -17,6 +17,25 @@ import fs from "fs";
 
 dotenv.config();
 
+const generateDeterministicDeviceKey = (macAddress) => {
+  const salt = "GoldenPlayer2026SecretSalt";
+  const input = macAddress.trim().toUpperCase() + salt;
+  let hashVal = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hashVal ^= input.charCodeAt(i);
+    hashVal = Math.imul(hashVal, 0x01000193);
+  }
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let key = "";
+  let unsignedHash = hashVal >>> 0;
+  for (let i = 0; i < 6; i++) {
+    const index = unsignedHash % chars.length;
+    key += chars[index];
+    unsignedHash = Math.floor(unsignedHash / chars.length);
+  }
+  return key;
+};
+
 // ==========================================
 // FIREBASE ADMIN INITIALIZATION
 // ==========================================
@@ -117,7 +136,14 @@ const sendTelegramMsg = async (msg) => {
 // ==========================================
 // HELPERS
 // ==========================================
-const sanitizeMac = (mac) => mac ? mac.replace(/[.#$\[\]]/g, "_").toUpperCase() : "";
+const sanitizeMac = (mac) => {
+  if (!mac || typeof mac !== "string") return "";
+  let clean = mac.trim().toUpperCase().replace(/[-_]/g, ":");
+  if (/^[0-9A-Z]{12}$/.test(clean)) {
+    clean = clean.match(/.{1,2}/g).join(":");
+  }
+  return clean.replace(/[.#$\[\]]/g, "");
+};
 const isValidMac = (mac) => {
   if (!mac || typeof mac !== "string") return false;
   return /^[0-9A-Z:\-_]{3,30}$/i.test(mac.trim());
@@ -775,24 +801,59 @@ server.post("/webhook/lemonsqueezy", bodyParser.raw({ type: "application/json" }
       return;
     }
     const payload = JSON.parse(req.body.toString());
+    console.log("Raw Payload Received (Local):", JSON.stringify(payload));
     if (payload.meta.event_name === "order_created") {
-      const mac = payload.meta.custom_data?.mac;
+      const customData = payload.meta?.custom_data || payload.data?.attributes?.custom_data;
+      const mac = customData?.mac || customData?.mac_address;
       if (!mac || !isValidMac(mac)) return;
       const sanitizedMac = sanitizeMac(mac);
-      const amountPaidCents = payload.data.attributes.total;
-      const coinsToAdd = Math.floor(amountPaidCents / 100);
+      const orderItem = payload.data?.attributes?.first_order_item;
+      const productId = orderItem?.product_id?.toString();
+      const variantId = orderItem?.variant_id?.toString();
       const devRef = rtdb.ref(`devices/${sanitizedMac}`);
       const devSnap = await devRef.get();
-      await devRef.update({ coins: (devSnap.exists() ? devSnap.val().coins || 0 : 0) + coinsToAdd });
-      await processApprovedPayment({
-        mac: sanitizedMac,
-        fullName: payload.data.attributes.user_name || "Customer",
-        email: payload.data.attributes.user_email || "",
-        coins: coinsToAdd,
-        amount: (amountPaidCents / 100).toFixed(2),
-        method: "Credit Card (Lemon Squeezy)",
-      });
-      await sendTelegramMsg(`🍋 <b>Lemon Squeezy Payment</b>\n<b>MAC:</b> <code>${mac}</code>\n<b>Amount:</b> ${(amountPaidCents/100).toFixed(2)} EUR\n<b>Coins:</b> ${coinsToAdd}`);
+
+      if (productId === "1708792" || variantId === "1708792") {
+        console.log(`Processing Lifetime activation locally for product/variant ID: ${productId || variantId}`);
+        const randomYear = Math.floor(Math.random() * (3100 - 3000 + 1)) + 3000;
+        const newExpiry = `${randomYear}-12-31T23:59:59Z`;
+        const currentCoins = devSnap.exists() ? devSnap.val().coins || 0 : 0;
+
+        await devRef.update({
+          status: "Active",
+          expiryDate: newExpiry,
+          lastPlan: "LIFETIME",
+          coins: currentCoins + 20,
+          updatedAt: new Date().toISOString()
+        });
+
+        await processApprovedPayment({
+          mac: sanitizedMac,
+          fullName: payload.data.attributes.user_name || "Customer",
+          email: payload.data.attributes.user_email || "",
+          coins: 20,
+          amount: (payload.data.attributes.total / 100).toFixed(2),
+          method: "Credit Card (Lemon Squeezy - Lifetime)",
+        });
+
+        await sendTelegramMsg(`🍋 <b>Lemon Squeezy Lifetime Activation</b>\n<b>MAC:</b> <code>${mac}</code>\n<b>Amount:</b> ${(payload.data.attributes.total / 100).toFixed(2)} EUR\n<b>Plan:</b> LIFETIME`);
+      } else {
+        const amountPaidCents = payload.data.attributes.total;
+        const coinsToAdd = Math.floor(amountPaidCents / 100);
+        await devRef.update({
+          coins: (devSnap.exists() ? devSnap.val().coins || 0 : 0) + coinsToAdd,
+          updatedAt: new Date().toISOString()
+        });
+        await processApprovedPayment({
+          mac: sanitizedMac,
+          fullName: payload.data.attributes.user_name || "Customer",
+          email: payload.data.attributes.user_email || "",
+          coins: coinsToAdd,
+          amount: (amountPaidCents / 100).toFixed(2),
+          method: "Credit Card (Lemon Squeezy)",
+        });
+        await sendTelegramMsg(`🍋 <b>Lemon Squeezy Payment</b>\n<b>MAC:</b> <code>${mac}</code>\n<b>Amount:</b> ${(amountPaidCents/100).toFixed(2)} EUR\n<b>Coins:</b> ${coinsToAdd}`);
+      }
     }
   } catch (err) {
     console.error("LS Webhook error:", err.message);
@@ -823,11 +884,27 @@ server.post("/api/admin/approve-request", async (req, res) => {
     const mac = sanitizeMac(reqData.mac || "");
     const coinsToAdd = reqData.coins || 10;
 
-    // Credit coins
-    const balSnap = await rtdb.ref(`users_balance/${mac}`).get();
-    await rtdb.ref(`users_balance/${mac}`).update({
-      coins: (balSnap.exists() ? balSnap.val().coins || 0 : 0) + coinsToAdd
-    });
+    // ─── Credit coins to devices/${mac}/coins (UNIFIED PATH) ───────────────
+    const devRef = rtdb.ref(`devices/${mac}`);
+    const devSnap = await devRef.get();
+    if (!devSnap.exists()) {
+      // Auto-register device if it doesn't exist yet
+      console.log(`[Approve] Auto-registering device ${mac} during payment approval`);
+      const autoKey = generateDeterministicDeviceKey(mac);
+      await devRef.set({
+        macAddress: mac,
+        status: "Expired",
+        coins: 0,
+        expiryDate: null,
+        deviceKey: autoKey,
+        autoRegistered: true,
+        registeredAt: new Date().toISOString(),
+      });
+    }
+    const currentDevSnap = await devRef.get();
+    const currentCoins = currentDevSnap.val()?.coins || 0;
+    await devRef.update({ coins: currentCoins + coinsToAdd });
+    console.log(`[Approve] ✅ Credited ${coinsToAdd} coins to devices/${mac}/coins (was ${currentCoins}, now ${currentCoins + coinsToAdd})`);
 
     // Update request status
     await rtdb.ref(dbPath).update({ status: "Approved" });
@@ -1081,43 +1158,156 @@ server.post("/api/create-checkout", async (req, res) => {
   }
 });
 
-// ─── Activation Endpoint ──────────────────────────────────────────────────────
-server.post("/api/activate", activateLimiter, async (req, res) => {
+// ─── Device Self-Registration Endpoint ───────────────────────────────────────
+// Allows a new device to register itself and receive its deviceKey for login.
+server.post("/api/register-device", async (req, res) => {
+  const { mac } = req.body;
+  if (!mac || !isValidMac(mac)) {
+    return res.status(400).json({ success: false, message: "Invalid MAC Address Format" });
+  }
+
+  if (!hasServiceAccount && !process.env.GOOGLE_APPLICATION_CREDENTIALS && !process.env.K_SERVICE) {
+    return res.status(500).json({ success: false, message: "Firebase Service Account Key is missing on the server." });
+  }
+
+  const sanitizedMac = sanitizeMac(mac);
+  const devRef = rtdb.ref(`devices/${sanitizedMac}`);
+
+  try {
+    const devSnap = await devRef.get();
+
+    if (devSnap.exists()) {
+      // Device already registered — return masked key so user knows it exists
+      const data = devSnap.val();
+      const existingKey = data.deviceKey || data.device_key || "";
+      // Mask: show first 2 chars + *** + last 2 chars
+      const maskedKey = existingKey.length > 4
+        ? existingKey.substring(0, 2) + "***" + existingKey.slice(-2)
+        : "***";
+      console.log(`[Register] Device ${sanitizedMac} already registered.`);
+      return res.json({
+        success: true,
+        alreadyExists: true,
+        message: `Device already registered. Your device key ends with: ${maskedKey}. Contact support if you lost it.`,
+        macAddress: sanitizedMac,
+      });
+    }
+
+    // New device — generate a deterministic key based on the MAC address
+    const autoKey = generateDeterministicDeviceKey(sanitizedMac);
+    await devRef.set({
+      macAddress: sanitizedMac,
+      status: "Expired",
+      coins: 0,
+      expiryDate: null,
+      deviceKey: autoKey,
+      autoRegistered: true,
+      registeredAt: new Date().toISOString(),
+    });
+
+    console.log(`[Register] ✅ New device registered: ${sanitizedMac} → Key: ${autoKey}`);
+    await sendTelegramMsg(`📱 <b>New Device Registered</b>\n<b>MAC:</b> <code>${sanitizedMac}</code>\n<b>Key:</b> <code>${autoKey}</code>`);
+
+    return res.json({
+      success: true,
+      alreadyExists: false,
+      message: "Device registered successfully! Save your Device Key — you will need it to log in.",
+      macAddress: sanitizedMac,
+      deviceKey: autoKey,
+    });
+
+  } catch (err) {
+    console.error("[Register] Error:", err.message);
+    return res.status(500).json({ success: false, message: "Internal Server Error" });
+  }
+});
+
+// ─── Activation Handler (shared by /api/activate and /api/activate-node) ──────
+const handleActivation = async (req, res) => {
   const { mac } = req.body;
   if (!mac || !isValidMac(mac)) return res.status(400).json({ success: false, message: "Invalid MAC Address Format" });
 
   if (!hasServiceAccount && !process.env.GOOGLE_APPLICATION_CREDENTIALS && !process.env.K_SERVICE) {
     return res.status(500).json({
       success: false,
-      message: "Firebase Service Account Key is missing on the server. Please download 'firebase-service-account.json' from your Firebase Console, place it in the backend root directory, and restart the backend."
+      message: "Firebase Service Account Key is missing on the server."
     });
   }
 
   const sanitizedMac = sanitizeMac(mac);
   try {
     const devRef = rtdb.ref(`devices/${sanitizedMac}`);
-    const devSnap = await devRef.get();
-    if (!devSnap.exists() || (devSnap.val().coins || 0) < 10) {
-      return res.status(400).json({ success: false, message: "Insufficient Credits or Device Not Found" });
+    let devSnap = await devRef.get();
+
+    // ── AUTO-REGISTRATION: Create device record if it doesn't exist ──────────
+    if (!devSnap.exists()) {
+      console.log(`📝 Auto-registering new device: ${sanitizedMac}`);
+      const autoKey = generateDeterministicDeviceKey(sanitizedMac);
+      await devRef.set({
+        macAddress: sanitizedMac,
+        status: "Expired",
+        coins: 0,
+        expiryDate: null,
+        deviceKey: autoKey,
+        autoRegistered: true,
+        registeredAt: new Date().toISOString(),
+      });
+      devSnap = await devRef.get();
     }
+
+    // ── COINS: Single source of truth = devices/${mac}/coins ─────────────────
+    // Migrate any legacy coins from users_balance → devices (one-time, transparent)
+    const legacyBalSnap = await rtdb.ref(`users_balance/${sanitizedMac}`).get();
+    if (legacyBalSnap.exists()) {
+      const legacyCoins = legacyBalSnap.val()?.coins || 0;
+      if (legacyCoins > 0) {
+        const freshDevSnap = await devRef.get();
+        const currentCoins = freshDevSnap.val()?.coins || 0;
+        await devRef.update({ coins: currentCoins + legacyCoins });
+        await rtdb.ref(`users_balance/${sanitizedMac}`).remove();
+        devSnap = await devRef.get();
+        console.log(`[Activate] 🔄 Migrated ${legacyCoins} coins from users_balance → devices/${sanitizedMac}`);
+      }
+    }
+
+    const devData = devSnap.val();
+    const totalCoins = devData.coins || 0;
+
+    if (totalCoins < 10) {
+      return res.status(400).json({ success: false, message: "Insufficient Credits. Activation requires 10 Credits." });
+    }
+
+    // ── DEDUCT 10 COINS from devices/${mac}/coins only ───────────────────────
+    const newDevCoins = totalCoins - 10;
+
     const randomSegment = () => crypto.randomBytes(2).toString("hex").toUpperCase();
     const generatedLicense = `GP-${randomSegment()}-${randomSegment()}-${randomSegment()}`;
     const now = Date.now();
     const oneYearFromNow = now + 365 * 24 * 60 * 60 * 1000;
+
+    // ── Write new coin count to devices/${mac}/coins ─────────────────────────
+    await devRef.update({ coins: newDevCoins });
+    console.log(`[Activate] ✅ Coins updated: ${totalCoins} → ${newDevCoins} for ${sanitizedMac}`);
+
+    // Apply activation
     await devRef.update({
-      coins: devSnap.val().coins - 10,
       status: "Active",
       activationDate: now,
       expiryDate: new Date(oneYearFromNow).toISOString(),
       lastPlan: "1YEAR",
       licenseKey: generatedLicense,
     });
+
     await sendTelegramMsg(`✅ <b>License Activated</b>\n<b>MAC:</b> <code>${mac}</code>\n<b>License:</b> <code>${generatedLicense}</code>`);
     return res.json({ success: true, license: generatedLicense, message: "License Activated Successfully" });
   } catch (err) {
+    console.error("Activation error:", err.message);
     return res.status(500).json({ success: false, message: "Internal Server Error" });
   }
-});
+};
+
+server.post("/api/activate", activateLimiter, handleActivation);
+server.post("/api/activate-node", activateLimiter, handleActivation);
 
 // ==========================================
 // FIREBASE RTDB LISTENERS (Crypto auto-detection)
@@ -1144,8 +1334,16 @@ const checkTronTransaction = async (reqId, req) => {
       processedCryptoTxIds.add(match.transaction_id);
       const mac = sanitizeMac(req.mac || "");
       const coinsToAdd = req.coins || 10;
-      const balSnap = await rtdb.ref(`users_balance/${mac}`).get();
-      await rtdb.ref(`users_balance/${mac}`).update({ coins: (balSnap.exists() ? balSnap.val().coins || 0 : 0) + coinsToAdd });
+      // ─── Write coins to devices/${mac}/coins (UNIFIED PATH) ───────────
+      const cryptoDevRef = rtdb.ref(`devices/${mac}`);
+      const cryptoDevSnap = await cryptoDevRef.get();
+      if (!cryptoDevSnap.exists()) {
+        const autoKey = generateDeterministicDeviceKey(mac);
+        await cryptoDevRef.set({ macAddress: mac, status: "Expired", coins: 0, expiryDate: null, deviceKey: autoKey, autoRegistered: true, registeredAt: new Date().toISOString() });
+      }
+      const freshSnap = await cryptoDevRef.get();
+      await cryptoDevRef.update({ coins: (freshSnap.val()?.coins || 0) + coinsToAdd });
+      console.log(`[Crypto] ✅ Credited ${coinsToAdd} coins to devices/${mac}/coins`);
       await rtdb.ref(`payment_requests/${reqId}`).update({ status: "Approved (Auto)" });
       await processApprovedPayment({ ...req, mac, requestId: reqId, dbPath: `payment_requests/${reqId}` });
       await sendTelegramMsg(
@@ -1197,5 +1395,5 @@ server.listen(PORT, () => {
   console.log(`🚀 Backend Server running on http://localhost:${PORT}`);
   console.log("📄 Invoice Engine: Puppeteer-Core (system Edge/Chrome)");
   console.log("📧 Email Engine: Nodemailer →", process.env.SMTP_HOST || "smtp-relay.brevo.com");
-  console.log("📡 Endpoints: /api/admin/approve-request | /api/admin/decline-request | /api/activate");
+  console.log("📡 Endpoints: /api/admin/approve-request | /api/admin/decline-request | /api/activate | /api/activate-node");
 });

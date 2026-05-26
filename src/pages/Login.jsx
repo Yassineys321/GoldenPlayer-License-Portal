@@ -3,12 +3,17 @@ import { useNavigate } from 'react-router-dom';
 import { Smartphone, ChevronRight, ShieldCheck, Zap, Globe, Lock, UserCircle, Cpu } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { useTheme } from '../context/ThemeContext';
+import { useAlert } from '../context/AlertContext';
+import { rtdb } from '../firebase';
+import { ref, get } from 'firebase/database';
 
 const Login = () => {
   const [mac, setMac] = useState('');
+  const [deviceKey, setDeviceKey] = useState('');
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
   const { isDark } = useTheme();
+  const { error, success } = useAlert();
 
   useEffect(() => {
     const saved = localStorage.getItem('user_mac');
@@ -17,13 +22,62 @@ const Login = () => {
 
   const handleLogin = (e) => {
     e.preventDefault();
-    if (!mac.trim()) return;
+    const macTrimmed = mac.trim();
+    const keyTrimmed = deviceKey.trim();
+
+    if (!macTrimmed || !keyTrimmed) return;
+
+    // 1. Normalize separators: dashes and underscores → colons, then validate
+    const normalizedMac = macTrimmed.toUpperCase().replace(/[-_]/g, ':');
+    const macRegex = /^([0-9A-F]{2}:){5}[0-9A-F]{2}$/;
+    if (!macRegex.test(normalizedMac)) {
+      error("Invalid MAC Address format. Accepted formats: AA:BB:CC:DD:EE:FF, AA-BB-CC-DD-EE-FF", "Format Error");
+      return;
+    }
+
     setLoading(true);
-    setTimeout(() => {
-      const safeMac = mac.toUpperCase().replace(/[.#$\[\]]/g, '_');
-      localStorage.setItem('user_mac', safeMac);
+    const cleanMac = normalizedMac;
+    const cleanKey = keyTrimmed.toUpperCase();
+
+    // 2. Database Verification
+    get(ref(rtdb, 'devices/' + cleanMac)).then((snap) => {
+      console.log(`[Auth Debug] Connection attempt for MAC: "${cleanMac}" with Key: "${cleanKey}"`);
+      if (!snap.exists()) {
+        console.warn(`[Auth Debug] MAC "${cleanMac}" not found in database path: devices/${cleanMac}`);
+        error("Device is not whitelisted or registered in our system.", "Access Denied");
+        setLoading(false);
+        return;
+      }
+
+      const devData = snap.val();
+
+      // Support all potential key variants in database
+      const rawKey = devData.deviceKey ?? devData.device_key ?? devData.key ?? "";
+      const rawLicense = devData.licenseKey ?? devData.license_key ?? devData.license ?? "";
+
+      // Type Cast, trim, and uppercase for robust comparison
+      const storedKey = String(rawKey).trim().toUpperCase();
+      const storedLicense = String(rawLicense).trim().toUpperCase();
+
+      console.log(`[Auth Debug] Stored Key (DB): "${storedKey}" (type: ${typeof rawKey})`);
+      console.log(`[Auth Debug] Stored License (DB): "${storedLicense}" (type: ${typeof rawLicense})`);
+
+      if (cleanKey !== storedKey && cleanKey !== storedLicense) {
+        console.error(`[Auth Debug] Key mismatch! Input "${cleanKey}" does not match stored key "${storedKey}" or stored license "${storedLicense}"`);
+        error("Invalid Device Key or License Key.", "Authentication Failed");
+        setLoading(false);
+        return;
+      }
+
+      console.log(`[Auth Debug] Connection successful for MAC "${cleanMac}"`);
+      localStorage.setItem('user_mac', cleanMac);
+      success("Authorized successfully!", "Connected");
       navigate('/');
-    }, 1200);
+    }).catch((err) => {
+      console.error("[Auth Debug] Database error during connection check:", err);
+      error("Database error: " + err.message, "Network Error");
+      setLoading(false);
+    });
   };
 
   return (
@@ -87,6 +141,21 @@ const Login = () => {
                   />
                 </div>
                 <span className="input-hint">Path: Settings &gt; System &gt; Node ID</span>
+              </div>
+
+              <div className="input-group">
+                <label>DEVICE KEY</label>
+                <div className="input-wrapper">
+                  <Lock size={18} className="f-icon" />
+                  <input
+                    type="text"
+                    placeholder="Enter your Device Key..."
+                    className="input-field"
+                    value={deviceKey}
+                    onChange={(e) => setDeviceKey(e.target.value)}
+                    required
+                  />
+                </div>
               </div>
 
               <button type="submit" className="btn btn-primary btn-full btn-auth" disabled={loading}>

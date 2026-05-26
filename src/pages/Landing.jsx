@@ -7,14 +7,43 @@ import {
 } from 'lucide-react';
 import { useTheme } from '../context/ThemeContext';
 import { useLanguage } from '../LanguageContext';
+import { useAlert } from '../context/AlertContext';
+import { rtdb } from '../firebase';
+import { ref, get, set } from 'firebase/database';
+
+const generateDeterministicDeviceKey = (macAddress) => {
+  const salt = "GoldenPlayer2026SecretSalt";
+  const input = macAddress.trim().toUpperCase() + salt;
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let key = "";
+  let unsignedHash = hash >>> 0;
+  for (let i = 0; i < 6; i++) {
+    const index = unsignedHash % chars.length;
+    key += chars[index];
+    unsignedHash = Math.floor(unsignedHash / chars.length);
+  }
+  return key;
+};
 
 const Landing = () => {
   const navigate = useNavigate();
   const { isDark, toggleTheme } = useTheme();
   const [mac, setMac] = useState('');
+  const [deviceKey, setDeviceKey] = useState('');
   const [loading, setLoading] = useState(false);
   const { lang, setLang, t } = useLanguage();
   const [activeFaq, setActiveFaq] = useState(null);
+  const { error, success, info } = useAlert();
+  const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
+  const [registerMac, setRegisterMac] = useState('');
+  const [registerLoading, setRegisterLoading] = useState(false);
+  const [showRegisterModal, setShowRegisterModal] = useState(false);
+  const [registrationResult, setRegistrationResult] = useState(null);
 
   useEffect(() => {
     const saved = localStorage.getItem('user_mac');
@@ -23,12 +52,109 @@ const Landing = () => {
 
   const handleConnect = (e) => {
     e.preventDefault();
-    if (!mac.trim()) return;
+    const macTrimmed = mac.trim();
+    const keyTrimmed = deviceKey.trim();
+    
+    if (!macTrimmed || !keyTrimmed) return;
+
+    // 1. Normalize separators: dashes and underscores → colons, then validate
+    const normalizedMac = macTrimmed.toUpperCase().replace(/[-_]/g, ':');
+    const macRegex = /^([0-9A-F]{2}:){5}[0-9A-F]{2}$/;
+    if (!macRegex.test(normalizedMac)) {
+      error("Invalid MAC Address format. Accepted formats: AA:BB:CC:DD:EE:FF, AA-BB-CC-DD-EE-FF", "Format Error");
+      return;
+    }
+
     setLoading(true);
-    setTimeout(() => {
-      localStorage.setItem('user_mac', mac.toUpperCase());
+    const cleanMac = normalizedMac;
+    const cleanKey = keyTrimmed.toUpperCase();
+
+    // 2. Database Verification
+    get(ref(rtdb, 'devices/' + cleanMac)).then((snap) => {
+      console.log(`[Auth Debug] Connection attempt for MAC: "${cleanMac}" with Key: "${cleanKey}"`);
+      if (!snap.exists()) {
+        console.warn(`[Auth Debug] MAC "${cleanMac}" not found in database path: devices/${cleanMac}`);
+        error("Device is not whitelisted or registered in our system.", "Access Denied");
+        setLoading(false);
+        return;
+      }
+      
+      const devData = snap.val();
+      
+      // Support all potential key variants in database
+      const rawKey = devData.deviceKey ?? devData.device_key ?? devData.key ?? "";
+      const rawLicense = devData.licenseKey ?? devData.license_key ?? devData.license ?? "";
+
+      // Type Cast, trim, and uppercase for robust comparison
+      const storedKey = String(rawKey).trim().toUpperCase();
+      const storedLicense = String(rawLicense).trim().toUpperCase();
+
+      console.log(`[Auth Debug] Stored Key (DB): "${storedKey}" (type: ${typeof rawKey})`);
+      console.log(`[Auth Debug] Stored License (DB): "${storedLicense}" (type: ${typeof rawLicense})`);
+
+      if (cleanKey !== storedKey && cleanKey !== storedLicense) {
+        console.error(`[Auth Debug] Key mismatch! Input "${cleanKey}" does not match stored key "${storedKey}" or stored license "${storedLicense}"`);
+        error("Invalid Device Key or License Key.", "Authentication Failed");
+        setLoading(false);
+        return;
+      }
+
+      console.log(`[Auth Debug] Connection successful for MAC "${cleanMac}"`);
+      localStorage.setItem('user_mac', cleanMac);
+      success("Authorized successfully!", "Connected");
       navigate('/dashboard');
-    }, 1200);
+    }).catch((err) => {
+      console.error("[Auth Debug] Database error during connection check:", err);
+      error("Database error: " + err.message, "Network Error");
+      setLoading(false);
+    });
+  };
+
+  const handleRegisterDevice = async (e) => {
+    e.preventDefault();
+    const macTrimmed = registerMac.trim();
+    if (!macTrimmed) return;
+    const normalizedMac = macTrimmed.toUpperCase().replace(/[-_]/g, ':');
+    const macRegex = /^([0-9A-F]{2}:){5}[0-9A-F]{2}$/;
+    if (!macRegex.test(normalizedMac)) {
+      error("Invalid MAC Address format. Use: AA:BB:CC:DD:EE:FF", "Format Error");
+      return;
+    }
+    setRegisterLoading(true);
+    try {
+      // Check if device already exists
+      const existing = await get(ref(rtdb, 'devices/' + normalizedMac));
+      if (existing.exists()) {
+        error('This MAC address is already registered.', 'Already Exists');
+        setRegisterLoading(false);
+        return;
+      }
+
+      // Generate a deterministic device key based on the MAC Address
+      const deviceKey = generateDeterministicDeviceKey(normalizedMac);
+
+      // Write directly to Firebase RTDB — no backend needed
+      await set(ref(rtdb, 'devices/' + normalizedMac), {
+        macAddress: normalizedMac,
+        deviceKey,
+        status: 'Inactive',
+        coins: 0,
+        expiryDate: null,
+        registeredAt: new Date().toISOString(),
+      });
+
+      setRegistrationResult({ macAddress: normalizedMac, deviceKey });
+      setShowRegisterModal(false);
+    } catch (err) {
+      error('Registration failed: ' + err.message, 'Error');
+    } finally {
+      setRegisterLoading(false);
+    }
+  };
+
+
+  const copyToClipboard = (text) => {
+    navigator.clipboard.writeText(text).then(() => success('Copied!', 'Clipboard'));
   };
 
   const toggleFaq = (id) => setActiveFaq(activeFaq === id ? null : id);
@@ -121,6 +247,9 @@ const Landing = () => {
                     type="text" 
                     placeholder="Enter your Device Key..." 
                     className="modern-input mono-font"
+                    value={deviceKey}
+                    onChange={(e) => setDeviceKey(e.target.value)}
+                    required
                   />
                 </div>
               </div>
@@ -131,9 +260,209 @@ const Landing = () => {
               
               <p className="portal-path-hint">Path: Settings &gt; System &gt; Node ID</p>
             </form>
+
+            {/* ── Register New Device Link ── */}
+            <div style={{ textAlign: 'center', marginTop: '20px' }}>
+              <p style={{ color: 'var(--land-text-muted)', fontSize: '0.85rem', marginBottom: '10px' }}>
+                First time here? Don't have a Device Key yet?
+              </p>
+              <button
+                type="button"
+                onClick={() => setShowRegisterModal(true)}
+                style={{
+                  background: 'transparent',
+                  border: '1px solid var(--land-primary)',
+                  color: 'var(--land-primary)',
+                  padding: '10px 24px',
+                  borderRadius: '8px',
+                  cursor: 'pointer',
+                  fontSize: '0.85rem',
+                  fontWeight: 600,
+                  letterSpacing: '0.05em',
+                  transition: 'all 0.2s',
+                }}
+                onMouseEnter={e => { e.target.style.background = 'var(--land-primary)'; e.target.style.color = '#fff'; }}
+                onMouseLeave={e => { e.target.style.background = 'transparent'; e.target.style.color = 'var(--land-primary)'; }}
+              >
+                📱 REGISTER MY DEVICE
+              </button>
+            </div>
           </div>
         </motion.div>
       </section>
+
+      {/* ── Register Device Modal ── */}
+      <AnimatePresence>
+        {showRegisterModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            style={{
+              position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              zIndex: 9999, padding: '20px',
+            }}
+            onClick={() => setShowRegisterModal(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              onClick={e => e.stopPropagation()}
+              style={{
+                background: 'var(--land-card-bg, #1a1f2e)',
+                border: '1px solid var(--land-border)',
+                borderRadius: '16px', padding: '40px', maxWidth: '460px', width: '100%',
+              }}
+            >
+              <h3 style={{ color: '#fff', marginBottom: '8px', fontSize: '1.3rem' }}>📱 Register Your Device</h3>
+              <p style={{ color: 'var(--land-text-muted)', fontSize: '0.85rem', marginBottom: '24px' }}>
+                Enter your MAC Address to generate a unique Device Key. Save it — you'll need it to log in.
+              </p>
+              <form onSubmit={handleRegisterDevice}>
+                <div style={{ position: 'relative', marginBottom: '20px' }}>
+                  <input
+                    type="text"
+                    placeholder="AA:BB:CC:DD:EE:FF"
+                    value={registerMac}
+                    onChange={e => setRegisterMac(e.target.value)}
+                    style={{
+                      width: '100%', boxSizing: 'border-box',
+                      padding: '14px 16px', borderRadius: '10px',
+                      background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.15)',
+                      color: '#fff', fontSize: '1rem', fontFamily: 'monospace',
+                      outline: 'none',
+                    }}
+                    required
+                  />
+                </div>
+                <div style={{ display: 'flex', gap: '12px' }}>
+                  <button
+                    type="button"
+                    onClick={() => setShowRegisterModal(false)}
+                    style={{
+                      flex: 1, padding: '12px', borderRadius: '8px',
+                      background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.15)',
+                      color: '#fff', cursor: 'pointer', fontWeight: 600,
+                    }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={registerLoading}
+                    style={{
+                      flex: 2, padding: '12px', borderRadius: '8px',
+                      background: 'linear-gradient(135deg, var(--land-primary), #6366f1)',
+                      border: 'none', color: '#fff', cursor: 'pointer',
+                      fontWeight: 700, fontSize: '0.9rem', letterSpacing: '0.05em',
+                    }}
+                  >
+                    {registerLoading ? 'REGISTERING...' : 'GENERATE DEVICE KEY'}
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Registration Result Modal ── */}
+      <AnimatePresence>
+        {registrationResult && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            style={{
+              position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              zIndex: 9999, padding: '20px',
+            }}
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              style={{
+                background: 'var(--land-card-bg, #1a1f2e)',
+                border: '1px solid rgba(56,189,248,0.4)',
+                borderRadius: '16px', padding: '40px', maxWidth: '480px', width: '100%',
+                boxShadow: '0 0 40px rgba(56,189,248,0.15)',
+              }}
+            >
+              {registrationResult.alreadyExists ? (
+                <>
+                  <div style={{ fontSize: '2.5rem', textAlign: 'center', marginBottom: '16px' }}>⚠️</div>
+                  <h3 style={{ color: '#fbbf24', textAlign: 'center', marginBottom: '12px' }}>Device Already Registered</h3>
+                  <p style={{ color: 'var(--land-text-muted)', textAlign: 'center', fontSize: '0.9rem', marginBottom: '24px' }}>
+                    {registrationResult.message}
+                  </p>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontSize: '2.5rem', textAlign: 'center', marginBottom: '16px' }}>✅</div>
+                  <h3 style={{ color: '#34d399', textAlign: 'center', marginBottom: '12px' }}>Device Registered!</h3>
+                  <p style={{ color: 'var(--land-text-muted)', textAlign: 'center', fontSize: '0.85rem', marginBottom: '24px' }}>
+                    Your Device Key has been generated. <strong style={{ color: '#f87171' }}>Save it now</strong> — it won't be shown again!
+                  </p>
+                  <div style={{
+                    background: 'rgba(56,189,248,0.08)', border: '1px solid rgba(56,189,248,0.3)',
+                    borderRadius: '10px', padding: '20px', marginBottom: '20px', textAlign: 'center',
+                  }}>
+                    <p style={{ color: 'var(--land-text-muted)', fontSize: '0.75rem', marginBottom: '8px', letterSpacing: '0.1em' }}>DEVICE KEY</p>
+                    <p style={{ color: '#38bdf8', fontFamily: 'monospace', fontSize: '1.6rem', fontWeight: 700, letterSpacing: '0.15em', marginBottom: '12px' }}>
+                      {registrationResult.deviceKey}
+                    </p>
+                    <button
+                      onClick={() => copyToClipboard(registrationResult.deviceKey)}
+                      style={{
+                        padding: '8px 20px', borderRadius: '6px',
+                        background: 'rgba(56,189,248,0.2)', border: '1px solid rgba(56,189,248,0.4)',
+                        color: '#38bdf8', cursor: 'pointer', fontWeight: 600, fontSize: '0.8rem',
+                      }}
+                    >
+                      📋 Copy Key
+                    </button>
+                  </div>
+                  <div style={{ background: 'rgba(255,255,255,0.05)', borderRadius: '8px', padding: '12px', marginBottom: '20px', fontSize: '0.8rem', color: 'var(--land-text-muted)' }}>
+                    <strong style={{ color: '#fff' }}>MAC:</strong> {registrationResult.macAddress}
+                  </div>
+                </>
+              )}
+              <div style={{ display: 'flex', gap: '12px' }}>
+                {!registrationResult.alreadyExists && (
+                  <button
+                    onClick={() => {
+                      setDeviceKey(registrationResult.deviceKey);
+                      setMac(registrationResult.macAddress);
+                      setRegistrationResult(null);
+                    }}
+                    style={{
+                      flex: 2, padding: '12px', borderRadius: '8px',
+                      background: 'linear-gradient(135deg, #38bdf8, #6366f1)',
+                      border: 'none', color: '#fff', cursor: 'pointer',
+                      fontWeight: 700, fontSize: '0.9rem',
+                    }}
+                  >
+                    ⚡ Auto-fill & Login
+                  </button>
+                )}
+                <button
+                  onClick={() => setRegistrationResult(null)}
+                  style={{
+                    flex: 1, padding: '12px', borderRadius: '8px',
+                    background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.15)',
+                    color: '#fff', cursor: 'pointer', fontWeight: 600,
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* ── 3. SECTION 2: HOW IT WORKS ── */}
       <section className="process-section">

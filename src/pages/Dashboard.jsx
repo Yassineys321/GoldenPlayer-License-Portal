@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { rtdb } from '../firebase';
-import { ref, onValue, runTransaction, get, update } from 'firebase/database';
+import { ref, onValue, get, update, set } from 'firebase/database';
 import {
   ShieldCheck, Coins, Zap, Activity, ChevronRight,
   Layers, Loader2, Wifi, Calendar,
@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import { useTheme } from '../context/ThemeContext';
 import { useAlert } from '../context/AlertContext';
+
 
 // Simple copy feedback hook
 function useClipboard() {
@@ -55,8 +56,15 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (!mac) { navigate('/login'); return; }
-    const d = onValue(ref(rtdb, 'devices/' + mac), s => { if (s.exists()) setDevice(s.val()); });
-    const c = onValue(ref(rtdb, 'users_balance/' + mac), s => { if (s.exists()) setCoins(s.val().coins || 0); });
+    // ── Single source of truth: devices/${mac} ────────────────────────────────
+    const d = onValue(ref(rtdb, 'devices/' + mac), s => {
+      if (s.exists()) {
+        const data = s.val();
+        setDevice(data);
+        // Read coins from devices/${mac}/coins (unified path)
+        setCoins(data.coins || 0);
+      }
+    });
     const p = onValue(ref(rtdb, 'playlists/' + mac), s => {
       setPlaylists(s.exists() ? Object.entries(s.val()).map(([id, v]) => ({ id, ...v })) : []);
       setLoading(false);
@@ -71,57 +79,82 @@ export default function Dashboard() {
         setInvoices([]);
       }
     });
-    return () => { d(); c(); p(); inv(); };
+    return () => { d(); p(); inv(); };
   }, [mac, navigate]);
 
   const handleActivate = async () => {
     if (coins < 10) { warning('Insufficient credits. Activation requires 10 Credits.', 'Insufficient Balance'); return; }
     setActivating(true);
     try {
-      const res = await fetch(`${BACKEND_URL}/api/activate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mac })
+      const snap = await get(ref(rtdb, 'devices/' + mac));
+      if (!snap.exists()) { error('Device not found.', 'Error'); return; }
+      const current = snap.val();
+      const currentCoins = current.coins || 0;
+      if (currentCoins < 10) { warning('Insufficient credits.', 'Insufficient Balance'); return; }
+
+      const now = new Date();
+      const existing = current.expiryDate ? new Date(current.expiryDate) : null;
+      const newExpiry = existing && existing > now ? new Date(existing) : new Date();
+      newExpiry.setFullYear(newExpiry.getFullYear() + 1);
+
+      await update(ref(rtdb, 'devices/' + mac), {
+        status: 'Active',
+        coins: currentCoins - 10,
+        expiryDate: newExpiry.toISOString(),
+        lastPlan: '1YEAR',
       });
-      const data = await res.json();
-      if (data.success) {
-        success('License activated successfully!', 'Activated');
-      } else {
-        error(data.message, 'Failed');
-      }
+      success('License activated successfully!', 'Activated');
     } catch {
-      error('Connection error.', 'Error');
+      error('Activation failed. Please try again.', 'Error');
     } finally {
       setActivating(false);
     }
   };
 
+
   const handleActivatePlan = async (type) => {
     if (!mac) return;
-    const cost = type === 'LIFETIME' ? 20 : 10;
     setActivatingPlan(type);
     try {
-      const balanceRef = ref(rtdb, 'users_balance/' + mac);
-      const txResult = await runTransaction(balanceRef, (currentData) => {
-        const currentCoins = currentData?.coins ?? 0;
-        if (currentCoins < cost) {
-          return undefined;
-        }
-        return { ...currentData, coins: currentCoins - cost };
-      });
+      // 1. Check/auto-register device
+      let dSnap = await get(ref(rtdb, 'devices/' + mac));
+      if (!dSnap.exists()) {
+        const autoKey = Math.random().toString(36).substring(2, 8).toUpperCase();
+        await set(ref(rtdb, 'devices/' + mac), {
+          macAddress: mac, status: 'Expired', coins: 0,
+          expiryDate: null, deviceKey: autoKey,
+          autoRegistered: true, registeredAt: new Date().toISOString(),
+        });
+        dSnap = await get(ref(rtdb, 'devices/' + mac));
+      }
 
-      if (!txResult.committed) {
+      // 2. Migrate any legacy users_balance coins → devices/${mac}/coins
+      const legacySnap = await get(ref(rtdb, 'users_balance/' + mac));
+      if (legacySnap.exists()) {
+        const legacyCoins = legacySnap.val()?.coins || 0;
+        if (legacyCoins > 0) {
+          const currentCoins = dSnap.val()?.coins || 0;
+          await update(ref(rtdb, 'devices/' + mac), { coins: currentCoins + legacyCoins });
+          // Remove old path
+          await set(ref(rtdb, 'users_balance/' + mac), null);
+          dSnap = await get(ref(rtdb, 'devices/' + mac));
+        }
+      }
+
+      const cost = type === 'LIFETIME' ? 20 : 10;
+      const currentCoins = dSnap.val()?.coins || 0;
+
+      if (currentCoins < cost) {
         warning(`Insufficient credits. Activation requires ${cost} Credits.`, 'Insufficient Balance');
         setActivatingPlan(null);
         return;
       }
 
-      const dSnap = await get(ref(rtdb, 'devices/' + mac));
-      let expiryDate = null;
-      if (dSnap.exists() && dSnap.val().expiryDate) {
-        expiryDate = new Date(dSnap.val().expiryDate);
-      }
+      // 3. Deduct coins from devices/${mac}/coins (unified path)
+      await update(ref(rtdb, 'devices/' + mac), { coins: currentCoins - cost });
 
+      const expiryVal = dSnap.val()?.expiryDate;
+      const expiryDate = expiryVal ? new Date(expiryVal) : null;
       const now = new Date();
       let newExpiry;
 
@@ -133,7 +166,7 @@ export default function Dashboard() {
         newExpiry.setFullYear(newExpiry.getFullYear() + 1);
       }
 
-      const existingLicense = dSnap.exists() ? (dSnap.val().licenseKey || dSnap.val().deviceKey) : null;
+      const existingLicense = dSnap.val()?.licenseKey || dSnap.val()?.deviceKey;
       const licenseKey = existingLicense || `GP-${Math.floor(1000 + Math.random() * 9000)}-${Math.floor(1000 + Math.random() * 9000)}-${Math.floor(1000 + Math.random() * 9000)}`;
 
       await update(ref(rtdb, 'devices/' + mac), {

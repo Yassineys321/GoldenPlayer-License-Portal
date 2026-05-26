@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { rtdb, db, storage } from '../firebase';
-import { ref as dbRef, onValue, update, push, set, get, runTransaction } from 'firebase/database';
+import { ref as dbRef, onValue, update, push, set, get } from 'firebase/database';
 import { collection, addDoc } from 'firebase/firestore';
 import { ref as stRef, uploadBytes, getDownloadURL } from 'firebase/storage';
 import {
@@ -13,6 +13,25 @@ import {
 import { motion, AnimatePresence } from 'framer-motion';
 import { useLanguage } from '../LanguageContext';
 import { useAlert } from '../context/AlertContext';
+
+const generateDeterministicDeviceKey = (macAddress) => {
+  const salt = "GoldenPlayer2026SecretSalt";
+  const input = macAddress.trim().toUpperCase() + salt;
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let key = "";
+  let unsignedHash = hash >>> 0;
+  for (let i = 0; i < 6; i++) {
+    const index = unsignedHash % chars.length;
+    key += chars[index];
+    unsignedHash = Math.floor(unsignedHash / chars.length);
+  }
+  return key;
+};
 
 const TRON_API_KEY = '6b092603-47e5-4fdd-83cd-bfda97c6dd65';
 const USDT_CONTRACT = 'TR7NHqJEH7161iLpX8X'; // USDT Token Contract
@@ -53,7 +72,8 @@ const Store = () => {
 
   useEffect(() => {
     if (!mac) return;
-    return onValue(dbRef(rtdb, 'users_balance/' + mac), s => {
+    // ── Single source of truth: devices/${mac}/coins ─────────────────────────
+    return onValue(dbRef(rtdb, 'devices/' + mac), s => {
       if (s.exists()) setCoins(s.val().coins || 0);
     });
   }, [mac]);
@@ -266,38 +286,52 @@ const Store = () => {
   };
 
   const handleActivate = async (type) => {
-    const cost = type === 'LIFETIME' ? 20 : type === 'TEST' ? 1 : 10;
     setActivating(type);
     let deductedSuccessfully = false;
+    let cost = 0;
     try {
-      // ─── ATOMIC TRANSACTION: Prevents Race Conditions ───────────────────
-      // runTransaction guarantees the read + write is a single atomic server
-      // operation. Even if the user presses the button on two devices at the
-      // same time, Firebase will only allow ONE deduction to succeed.
-      const balanceRef = dbRef(rtdb, 'users_balance/' + mac);
-      const txResult = await runTransaction(balanceRef, (currentData) => {
-        // currentData is the latest server value — no stale cache
-        const currentCoins = currentData?.coins ?? 0;
-        if (currentCoins < cost) {
-          // Return undefined to ABORT the transaction (no write happens)
-          return undefined;
-        }
-        // Return the new value to COMMIT the deduction atomically
-        return { ...currentData, coins: currentCoins - cost };
-      });
+      // 1. Auto-register device if it doesn't exist yet
+      let dSnap = await get(dbRef(rtdb, 'devices/' + mac));
+      if (!dSnap.exists()) {
+        const autoKey = generateDeterministicDeviceKey(mac);
+        await set(dbRef(rtdb, 'devices/' + mac), {
+          macAddress: mac, status: 'Expired', coins: 0,
+          expiryDate: null, deviceKey: autoKey,
+          autoRegistered: true, registeredAt: new Date().toISOString(),
+        });
+        dSnap = await get(dbRef(rtdb, 'devices/' + mac));
+      }
 
-      if (!txResult.committed) {
-        // Transaction was aborted — insufficient coins at the server level
+      // 2. Migrate any legacy users_balance coins → devices/${mac}/coins
+      const legacySnap = await get(dbRef(rtdb, 'users_balance/' + mac));
+      if (legacySnap.exists()) {
+        const legacyCoins = legacySnap.val()?.coins || 0;
+        if (legacyCoins > 0) {
+          const currentCoins = dSnap.val()?.coins || 0;
+          await update(dbRef(rtdb, 'devices/' + mac), { coins: currentCoins + legacyCoins });
+          await set(dbRef(rtdb, 'users_balance/' + mac), null);
+          dSnap = await get(dbRef(rtdb, 'devices/' + mac));
+          console.log(`[Store] 🔄 Migrated ${legacyCoins} legacy coins → devices/${mac}`);
+        }
+      }
+
+      cost = type === 'LIFETIME' ? 20 : type === 'TEST' ? 1 : 10;
+
+      // 3. Read current coins from devices/${mac}/coins (single source of truth)
+      const currentCoins = dSnap.val()?.coins || 0;
+      if (currentCoins < cost) {
         warning(t('insufficient_coins'), 'Insufficient Balance');
         setActivating(false);
         return;
       }
+
+      // 4. Deduct coins directly from devices/${mac}/coins
+      await update(dbRef(rtdb, 'devices/' + mac), { coins: currentCoins - cost });
       deductedSuccessfully = true;
 
-      // ─── DEVICE EXPIRY UPDATE (runs only after confirmed deduction) ─────
-      const dSnap = await get(dbRef(rtdb, 'devices/' + mac));
+      // 5. Update device expiry
       let expiryDate = null;
-      if (dSnap.exists() && dSnap.val().expiryDate) {
+      if (dSnap.val()?.expiryDate) {
         expiryDate = new Date(dSnap.val().expiryDate);
       }
 
@@ -321,7 +355,7 @@ const Store = () => {
         lastPlan: type
       });
 
-      // Log to Compliance Ledger (non-fatal try/catch)
+      // 6. Audit log
       try {
         await push(dbRef(rtdb, 'audit_logs/' + mac), {
           timestamp: new Date().toISOString(),
@@ -335,13 +369,13 @@ const Store = () => {
       success(t('success_activation'), 'License Deployed');
     } catch (err) {
       console.error('Activation error:', err);
-      // If device update failed AFTER coins were already deducted,
-      // refund the coins so the user doesn't lose them.
-      if (deductedSuccessfully) {
+      // Refund coins to devices/${mac}/coins if device update failed after deduction
+      if (deductedSuccessfully && cost > 0) {
         try {
-          await runTransaction(dbRef(rtdb, 'users_balance/' + mac), (d) => ({
-            ...d, coins: (d?.coins ?? 0) + cost
-          }));
+          const refundSnap = await get(dbRef(rtdb, 'devices/' + mac));
+          const refundCoins = refundSnap.val()?.coins || 0;
+          await update(dbRef(rtdb, 'devices/' + mac), { coins: refundCoins + cost });
+          console.log(`[Store] 💰 Refunded ${cost} coins to devices/${mac}`);
         } catch (refundErr) {
           console.error('Refund failed:', refundErr);
         }

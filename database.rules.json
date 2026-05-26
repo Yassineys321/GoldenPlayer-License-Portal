@@ -1,0 +1,47 @@
+{
+  "rules": {
+    "devices": {
+      "$mac": {
+        ".read": "true",
+        // Only allow writing if the device node already exists (pre-whitelisted by admin)
+        // or if the action is performed by an authenticated administrator.
+        ".write": "data.exists() || (auth != null && auth.token.admin === true)"
+      }
+    },
+    "users_balance": {
+      "$mac": {
+        ".read": "true",
+        ".write": "data.exists() || (auth != null && auth.token.admin === true)"
+      }
+    },
+    "playlists": {
+      "$mac": {
+        ".read": "true",
+        ".write": "true"
+      }
+    },
+    "audit_logs": {
+      "$mac": {
+        ".read": "true",
+        ".write": "true"
+      }
+    },
+    "payment_requests": {
+      ".read": "auth != null && auth.token.admin === true",
+      "$request_id": {
+        // Users can create a new request, but only admins can update/approve it
+        ".write": "!data.exists() || (auth != null && auth.token.admin === true)"
+      }
+    },
+    "pending_payments": {
+      ".read": "auth != null && auth.token.admin === true",
+      "$request_id": {
+        ".write": "!data.exists() || (auth != null && auth.token.admin === true)"
+      }
+    },
+    "invoices": {
+      ".read": "true",
+      ".write": "auth != null && auth.token.admin === true"
+    }
+  }
+}

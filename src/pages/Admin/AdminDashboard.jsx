@@ -46,6 +46,25 @@ const Lightbox = ({ src, onClose }) => (
   </div>
 );
 
+const generateDeterministicDeviceKey = (macAddress) => {
+  const salt = "GoldenPlayer2026SecretSalt";
+  const input = macAddress.trim().toUpperCase() + salt;
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let key = "";
+  let unsignedHash = hash >>> 0;
+  for (let i = 0; i < 6; i++) {
+    const index = unsignedHash % chars.length;
+    key += chars[index];
+    unsignedHash = Math.floor(unsignedHash / chars.length);
+  }
+  return key;
+};
+
 // ── Admin Dashboard ───────────────────────────────────────────────────────────
 const AdminDashboard = () => {
   const [devices, setDevices]         = useState([]);
@@ -144,14 +163,20 @@ const AdminDashboard = () => {
 
   // ── Actions ──────────────────────────────────────────────────────────────────
   const addDevice = async () => {
-    if (!newMac.trim()) return;
-    const clean = newMac.trim().toUpperCase().replace(/[:.\\-]/g, '');
+    const macTrimmed = newMac.trim();
+    if (!macTrimmed) return;
+    const macRegex = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
+    if (!macRegex.test(macTrimmed)) {
+      alert("Invalid MAC Address format. Must be exactly XX:XX:XX:XX:XX:XX");
+      return;
+    }
+    const clean = macTrimmed.toUpperCase();
     await set(ref(rtdb, 'devices/' + clean), {
-      macAddress: newMac,
+      macAddress: clean,
       status: 'Expired',
       coins: 0,
       expiryDate: null,
-      deviceKey: Math.random().toString(36).substring(2, 8).toUpperCase()
+      deviceKey: generateDeterministicDeviceKey(clean)
     });
     setNewMac('');
   };

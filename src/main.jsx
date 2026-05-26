@@ -6,9 +6,14 @@ import { ThemeProvider } from './context/ThemeContext'
 
 let savedMac = localStorage.getItem('user_mac');
 if (savedMac) {
-  const safeMac = savedMac.replace(/[.#$\[\]]/g, '_');
-  if (savedMac !== safeMac) {
-    localStorage.setItem('user_mac', safeMac);
+  let cleanMac = savedMac.trim().toUpperCase().replace(/[-_]/g, ':');
+  if (/^[0-9A-Z]{12}$/.test(cleanMac)) {
+    cleanMac = cleanMac.match(/.{1,2}/g).join(':');
+  }
+  // Remove any remaining invalid characters (forbidden in Firebase keys)
+  cleanMac = cleanMac.replace(/[.#$\[\]]/g, '');
+  if (savedMac !== cleanMac) {
+    localStorage.setItem('user_mac', cleanMac);
   }
 }
 
